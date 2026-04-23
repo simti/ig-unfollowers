@@ -1,0 +1,19 @@
+{
+  "name": "ig-unfollowers",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Compare Instagram followers vs. following and list people who don't follow you back.",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "login": "node src/index.js --login-only",
+    "postinstall": "playwright install chromium"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "playwright": "^1.47.0"
+  }
+}

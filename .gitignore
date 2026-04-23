@@ -1,0 +1,7 @@
+node_modules/
+.browser-data/
+output/
+.env
+.env.local
+*.log
+.DS_Store
