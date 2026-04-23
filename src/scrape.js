@@ -219,54 +219,120 @@ async function openListDialog(page, profileUsername, listType) {
 }
 
 /**
- * Scroll the followers/following dialog once. Prefers scrolling the LAST
- * user row into view (which reliably triggers IG's lazy-load) over setting
- * scrollTop on a guessed container.
+ * Scroll the followers/following dialog once using multiple strategies.
+ * Returns the bounding box of the chosen scroller so the caller can dispatch
+ * a real Playwright mouse wheel event on top of it (which is the most
+ * reliable way to trigger Instagram's lazy-load on recent builds).
  */
 async function scrollDialogOnce(page, profileUsername) {
-  return page.evaluate((self) => {
-    const dlg = document.querySelector('div[role="dialog"]');
-    if (!dlg) return { ok: false, rows: 0 };
-
-    // Choose the scrollable descendant that contains the MOST profile links.
-    // This avoids picking a "Suggested" sub-scroller or header bar.
-    const scrollables = [...dlg.querySelectorAll('*')].filter((el) => {
-      const s = getComputedStyle(el);
-      return s.overflowY === 'auto' || s.overflowY === 'scroll';
-    });
+  const result = await page.evaluate((self) => {
     const skip = new Set([
       'explore','p','reels','stories','direct','accounts','tv',
       'challenge','legal','about','developer', self,
     ]);
+    const isProfileLink = (a) => {
+      const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)\/?$/);
+      return !!m && !skip.has(m[1]);
+    };
     const profileLinks = (root) =>
-      [...root.querySelectorAll('a[role="link"][href^="/"]')].filter((a) => {
-        const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)\/?$/);
-        return m && !skip.has(m[1]);
-      });
+      [...root.querySelectorAll('a[href^="/"]')].filter(isProfileLink);
+
+    // Search the entire document for scrollables — IG sometimes renders the
+    // list in a wrapper outside the dialog node.
+    const candidates = [...document.querySelectorAll('div, section, ul, main')].filter(
+      (el) => {
+        const s = getComputedStyle(el);
+        const canScroll =
+          s.overflowY === 'auto' ||
+          s.overflowY === 'scroll' ||
+          s.overflow === 'auto' ||
+          s.overflow === 'scroll';
+        return canScroll && el.scrollHeight > el.clientHeight + 4;
+      }
+    );
 
     let best = null;
     let bestCount = -1;
-    for (const s of scrollables) {
-      const c = profileLinks(s).length;
-      if (c > bestCount) {
-        best = s;
-        bestCount = c;
+    for (const c of candidates) {
+      const n = profileLinks(c).length;
+      if (n > bestCount) {
+        best = c;
+        bestCount = n;
       }
     }
-    if (!best) {
-      // Fallback: scroll the dialog itself if no specific scroller found.
-      dlg.scrollTop = dlg.scrollHeight;
-      return { ok: true, rows: profileLinks(dlg).length };
+    // If nothing has profile links yet (very first frame), fall back to the
+    // tallest scrollable.
+    if (!best || bestCount === 0) {
+      let tallest = null;
+      let tallestH = 0;
+      for (const c of candidates) {
+        if (c.scrollHeight > tallestH) {
+          tallest = c;
+          tallestH = c.scrollHeight;
+        }
+      }
+      best = tallest || best;
     }
 
+    if (!best) {
+      return { ok: false, reason: 'no_scrollable', candidates: candidates.length };
+    }
+
+    const before = best.scrollTop;
     const links = profileLinks(best);
+
+    // Strategy A: scrollIntoView on the last profile row.
     if (links.length > 0) {
       links[links.length - 1].scrollIntoView({ block: 'end', behavior: 'instant' });
-    } else {
-      best.scrollTop = best.scrollHeight;
     }
-    return { ok: true, rows: links.length };
+    // Strategy B: assign scrollTop to scrollHeight.
+    best.scrollTop = best.scrollHeight;
+    // Strategy C: synthetic wheel event dispatched on the element.
+    best.dispatchEvent(
+      new WheelEvent('wheel', {
+        deltaY: Math.max(best.clientHeight, 1500),
+        deltaMode: 0,
+        bubbles: true,
+        cancelable: true,
+      })
+    );
+
+    const rect = best.getBoundingClientRect();
+    return {
+      ok: true,
+      links: links.length,
+      before,
+      after: best.scrollTop,
+      scrollHeight: best.scrollHeight,
+      clientHeight: best.clientHeight,
+      moved: best.scrollTop !== before,
+      rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height },
+      candidates: candidates.length,
+    };
   }, profileUsername);
+
+  // Strategy D: real Playwright mouse wheel inside the chosen scroller.
+  // This dispatches a trusted wheel event, which some IG builds require to
+  // start streaming the next page.
+  if (result?.ok && result.rect && result.rect.w > 0 && result.rect.h > 0) {
+    try {
+      const cx = result.rect.x + result.rect.w / 2;
+      const cy = result.rect.y + result.rect.h - Math.min(40, result.rect.h / 4);
+      await page.mouse.move(cx, cy);
+      await page.mouse.wheel(0, Math.max(800, result.rect.h));
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // Strategy E: keyboard. Focus the scroller and press End / PageDown.
+  try {
+    await page.keyboard.press('End');
+  } catch {
+    /* ignore */
+  }
+
+  return result;
 }
 
 /**
@@ -324,33 +390,52 @@ async function scrapeList({
 
     let idleCycles = 0;
     let lastSize = 0;
-    // If we know the target count, keep pushing past the idle limit until
-    // we're close (within 2%). This handles IG pausing pagination mid-list.
+    let retryBursts = 0;
+    let lastBurstSize = 0;
+    const maxRetryBursts = 4;
     const target = expectedCount && expectedCount > 0 ? expectedCount : null;
     const closeEnough = target ? Math.max(target - Math.ceil(target * 0.02), target - 5) : null;
 
+    let lastDiag = null;
     for (let i = 0; i < maxScrollIterations; i++) {
-      await scrollDialogOnce(page, profileUsername);
+      lastDiag = await scrollDialogOnce(page, profileUsername);
       await sleep(scrollDelayMs + Math.floor(Math.random() * 600));
 
       if (collected.size === lastSize) {
         idleCycles += 1;
-        const reachedTarget = target ? collected.size >= closeEnough : false;
 
         if (idleCycles >= idleScrollLimit) {
-          if (target && !reachedTarget && idleCycles < idleScrollLimit * 3) {
-            // Under-collected vs the profile-header count. Pause longer and
-            // try a harder scroll burst before giving up.
-            logger.info('Under target, pausing and retrying', {
+          const reachedTarget = target ? collected.size >= closeEnough : false;
+
+          if (target && !reachedTarget && retryBursts < maxRetryBursts) {
+            // Only keep retrying if the previous retry actually grew the list.
+            if (retryBursts > 0 && collected.size === lastBurstSize) {
+              logger.warn('Retry burst made no progress; giving up early', {
+                listType,
+                collected: collected.size,
+                target,
+                lastDiag,
+              });
+              break;
+            }
+            retryBursts += 1;
+            lastBurstSize = collected.size;
+            logger.info('Under target, doing a hard scroll burst', {
               listType,
               collected: collected.size,
               target,
+              attempt: retryBursts,
+              maxRetryBursts,
+              scroller: lastDiag,
             });
             await sleep(4000);
-            for (let k = 0; k < 5; k++) {
+            for (let k = 0; k < 8; k++) {
               await scrollDialogOnce(page, profileUsername);
               await sleep(scrollDelayMs);
             }
+            // Reset idleCycles so the loop gives the burst a fair chance to
+            // produce new rows before re-evaluating.
+            idleCycles = 0;
             continue;
           }
           logger.info('Reached end of list', {
@@ -363,11 +448,15 @@ async function scrapeList({
       } else {
         idleCycles = 0;
         lastSize = collected.size;
+        retryBursts = 0;
         if (i % 5 === 0) {
           logger.info('Scrolling...', {
             listType,
             collected: collected.size,
             target: target ?? 'unknown',
+            scroller: lastDiag
+              ? { rows: lastDiag.links, h: lastDiag.scrollHeight, moved: lastDiag.moved }
+              : null,
           });
         }
       }
