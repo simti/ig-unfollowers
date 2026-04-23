@@ -41,12 +41,19 @@ would.
 
 ### Limitations you should know up front
 
+- **Expect a gap between collected count and the profile header count.**
+  Instagram routinely returns fewer accounts than the public follower number
+  suggests — typically 80–95% of it. The difference is deactivated / newly
+  private / suspended accounts still counted on the header, plus IG's
+  per-session anti-scraping cap. The script detects when this has happened
+  (scroller pinned at its bottom, no new rows being served) and reports the
+  gap honestly rather than spinning. Waiting a few hours and rerunning often
+  yields a slightly higher count.
 - Instagram actively throttles/soft-blocks sessions that hit follower lists
   too frequently. The script throttles scrolls; still, don't run it every few
   minutes.
 - Very large accounts (hundreds of thousands of followers) will take a long
-  time and are more likely to be throttled. Instagram also caps how much of
-  a list is reachable in a single session.
+  time and are more likely to be throttled.
 - Usernames can change. The "not following back" list is a snapshot in time.
 - Selectors may still drift. The script prefers **role/href-based** locators,
   detects the scroll container dynamically, and uses **network interception**

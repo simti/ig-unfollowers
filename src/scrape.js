@@ -298,6 +298,7 @@ async function scrollDialogOnce(page, profileUsername) {
     );
 
     const rect = best.getBoundingClientRect();
+    const atBottom = best.scrollTop + best.clientHeight >= best.scrollHeight - 2;
     return {
       ok: true,
       links: links.length,
@@ -306,6 +307,7 @@ async function scrollDialogOnce(page, profileUsername) {
       scrollHeight: best.scrollHeight,
       clientHeight: best.clientHeight,
       moved: best.scrollTop !== before,
+      atBottom,
       rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height },
       candidates: candidates.length,
     };
@@ -392,6 +394,7 @@ async function scrapeList({
     let lastSize = 0;
     let retryBursts = 0;
     let lastBurstSize = 0;
+    let dialogRefreshDone = false;
     const maxRetryBursts = 4;
     const target = expectedCount && expectedCount > 0 ? expectedCount : null;
     const closeEnough = target ? Math.max(target - Math.ceil(target * 0.02), target - 5) : null;
@@ -407,14 +410,34 @@ async function scrapeList({
         if (idleCycles >= idleScrollLimit) {
           const reachedTarget = target ? collected.size >= closeEnough : false;
 
+          // If we're pinned at the bottom of the scroll container AND still
+          // under target, try closing and reopening the dialog once. On some
+          // IG builds that triggers a fresh paginated batch.
+          if (
+            !dialogRefreshDone &&
+            target && !reachedTarget &&
+            lastDiag?.atBottom
+          ) {
+            dialogRefreshDone = true;
+            logger.info(
+              'At bottom but under target — closing and reopening dialog once',
+              { listType, collected: collected.size, target }
+            );
+            await page.keyboard.press('Escape').catch(() => {});
+            await sleep(4000);
+            await openListDialog(page, profileUsername, listType);
+            await sleep(3000);
+            idleCycles = 0;
+            continue;
+          }
+
           if (target && !reachedTarget && retryBursts < maxRetryBursts) {
-            // Only keep retrying if the previous retry actually grew the list.
             if (retryBursts > 0 && collected.size === lastBurstSize) {
-              logger.warn('Retry burst made no progress; giving up early', {
+              logger.info('No more followers being served — ending scroll loop', {
                 listType,
                 collected: collected.size,
                 target,
-                lastDiag,
+                atBottom: !!lastDiag?.atBottom,
               });
               break;
             }
@@ -433,8 +456,6 @@ async function scrapeList({
               await scrollDialogOnce(page, profileUsername);
               await sleep(scrollDelayMs);
             }
-            // Reset idleCycles so the loop gives the burst a fair chance to
-            // produce new rows before re-evaluating.
             idleCycles = 0;
             continue;
           }
@@ -490,10 +511,15 @@ async function scrapeList({
     });
 
     if (expectedCount && collected.size < Math.floor(expectedCount * 0.95)) {
+      const gap = expectedCount - collected.size;
+      const pct = Math.round((collected.size / expectedCount) * 100);
       logger.warn(
-        `Collected ${collected.size}/${expectedCount} ${listType}. ` +
-          `Instagram may be throttling or virtualizing the list. ` +
-          `Try rerunning, increasing IDLE_SCROLL_LIMIT, or raising SCROLL_DELAY_MS.`
+        `Collected ${collected.size}/${expectedCount} ${listType} (${pct}%). ` +
+          `This ${gap}-account gap is almost always Instagram-side: deactivated / ` +
+          `newly-private / suspended accounts still counted on the profile header ` +
+          `but not returned in the list, plus IG's per-session anti-scraping cap. ` +
+          `The report below is accurate for the ${collected.size} accounts IG did ` +
+          `return. To try for more, wait a few hours and rerun — caps usually reset.`
       );
     }
 
