@@ -7,7 +7,7 @@ const path = require('path');
 const { chromium } = require('playwright');
 
 const logger = require('./logger');
-const { ensureLoggedIn, scrapeList } = require('./scrape');
+const { ensureLoggedIn, scrapeList, getProfileCounts } = require('./scrape');
 
 const CONFIG = {
   profile: (process.env.IG_PROFILE || 'moments_in_my').replace(/^@+/, '').toLowerCase(),
@@ -16,9 +16,9 @@ const CONFIG = {
   headless: String(process.env.HEADLESS || 'false').toLowerCase() === 'true',
   userDataDir: path.resolve(process.env.USER_DATA_DIR || './.browser-data'),
   outDir: path.resolve(process.env.OUT_DIR || './output'),
-  idleScrollLimit: parseInt(process.env.IDLE_SCROLL_LIMIT || '8', 10),
+  idleScrollLimit: parseInt(process.env.IDLE_SCROLL_LIMIT || '12', 10),
   maxScrollIterations: parseInt(process.env.MAX_SCROLL_ITERATIONS || '4000', 10),
-  scrollDelayMs: parseInt(process.env.SCROLL_DELAY_MS || '1400', 10),
+  scrollDelayMs: parseInt(process.env.SCROLL_DELAY_MS || '1800', 10),
 };
 
 const ARGS = new Set(process.argv.slice(2));
@@ -70,6 +70,17 @@ async function main() {
       return;
     }
 
+    // Read the expected counts from the profile header so the scraper can
+    // detect under-collection and keep going if Instagram pauses pagination.
+    await page.goto(`https://www.instagram.com/${CONFIG.profile}/`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page
+      .waitForSelector('header section, header[role="banner"]', { timeout: 30000 })
+      .catch(() => {});
+    const expected = await getProfileCounts(page, CONFIG.profile);
+    logger.info('Expected counts from profile header', expected);
+
     const followers = await scrapeList({
       page,
       profileUsername: CONFIG.profile,
@@ -77,6 +88,7 @@ async function main() {
       idleScrollLimit: CONFIG.idleScrollLimit,
       maxScrollIterations: CONFIG.maxScrollIterations,
       scrollDelayMs: CONFIG.scrollDelayMs,
+      expectedCount: expected.followers,
     });
 
     const following = await scrapeList({
@@ -86,15 +98,21 @@ async function main() {
       idleScrollLimit: CONFIG.idleScrollLimit,
       maxScrollIterations: CONFIG.maxScrollIterations,
       scrollDelayMs: CONFIG.scrollDelayMs,
+      expectedCount: expected.following,
     });
 
     const notFollowingBack = [...following].filter((u) => !followers.has(u)).sort();
     const fansNotFollowedBack = [...followers].filter((u) => !following.has(u)).sort();
 
+    const fmtTarget = (n) => (n == null ? '?' : n);
     console.log('\n===== Instagram unfollower report =====');
     console.log(`Profile:                     @${CONFIG.profile}`);
-    console.log(`Total followers collected:   ${followers.size}`);
-    console.log(`Total following collected:   ${following.size}`);
+    console.log(
+      `Total followers collected:   ${followers.size} (profile shows ${fmtTarget(expected.followers)})`
+    );
+    console.log(
+      `Total following collected:   ${following.size} (profile shows ${fmtTarget(expected.following)})`
+    );
     console.log(`Not following you back:      ${notFollowingBack.length}`);
     console.log(`You don't follow them back:  ${fansNotFollowedBack.length}`);
     console.log('=======================================\n');

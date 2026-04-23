@@ -110,9 +110,51 @@ async function dismissInterstitials(page) {
 }
 
 /**
- * Open the followers or following dialog. Uses the in-profile link to trigger
- * the UI that Instagram expects, rather than navigating directly to the URL
- * (direct navigation sometimes returns a login wall).
+ * Read the follower/following counts from the profile header. Returns
+ * { followers, following } where each is a number or null if unparseable.
+ * Used as a target so the scroll loop can detect under-collection and keep going.
+ */
+async function getProfileCounts(page, profileUsername) {
+  return page.evaluate((username) => {
+    const parseCount = (raw) => {
+      if (!raw) return null;
+      const txt = String(raw).replace(/[, ]/g, '').trim();
+      const m = txt.match(/^([\d.]+)\s*([KkMmBb]?)/);
+      if (!m) return null;
+      let n = parseFloat(m[1]);
+      const suffix = m[2].toLowerCase();
+      if (suffix === 'k') n *= 1e3;
+      if (suffix === 'm') n *= 1e6;
+      if (suffix === 'b') n *= 1e9;
+      return Math.round(n);
+    };
+    const readCount = (suffix) => {
+      const candidates = [
+        document.querySelector(`a[href="/${username}/${suffix}/"]`),
+        document.querySelector(`a[href$="/${username}/${suffix}/"]`),
+        document.querySelector(`header a[href$="/${suffix}/"]`),
+        document.querySelector(`a[href$="/${suffix}/"]`),
+      ].filter(Boolean);
+      for (const a of candidates) {
+        const titled = a.querySelector('[title]');
+        if (titled?.title) {
+          const n = parseCount(titled.title);
+          if (n != null) return n;
+        }
+        const span = a.querySelector('span span') || a.querySelector('span');
+        const n = parseCount(span?.textContent || a.textContent);
+        if (n != null) return n;
+      }
+      return null;
+    };
+    return { followers: readCount('followers'), following: readCount('following') };
+  }, profileUsername);
+}
+
+/**
+ * Open the followers or following dialog. Tries several locators because
+ * Instagram A/B-tests the markup; if every locator fails the script asks
+ * the user to click the count manually and waits.
  */
 async function openListDialog(page, profileUsername, listType) {
   const profileUrl = `${BASE}/${profileUsername}/`;
@@ -120,39 +162,119 @@ async function openListDialog(page, profileUsername, listType) {
   await page.goto(profileUrl, { waitUntil: 'domcontentloaded' });
   await dismissInterstitials(page);
 
-  // The followers/following buttons are <a> tags with hrefs ending in
-  // /followers/ or /following/. Multiple possible selectors in case of A/B tests.
-  const selectors = [
-    `a[href="/${profileUsername}/${listType}/"]`,
-    `a[href$="/${listType}/"]`,
+  // Wait for the profile header to render (the part with the post/follower counts).
+  await page
+    .waitForSelector('header section, header[role="banner"]', { timeout: 30000 })
+    .catch(() => {});
+  await sleep(1500);
+
+  const re = new RegExp(`^\\s*[\\d.,KkMmBb]+\\s+${listType}\\s*$`, 'i');
+
+  const candidateLocators = [
+    page.locator(`a[href="/${profileUsername}/${listType}/"]`).first(),
+    page.locator(`a[href$="/${profileUsername}/${listType}/"]`).first(),
+    page.locator(`header a[href$="/${listType}/"]`).first(),
+    page.locator(`a[href$="/${listType}/"]`).first(),
+    page.getByRole('link', { name: re }).first(),
+    page.getByRole('button', { name: re }).first(),
+    page.getByRole('link', { name: new RegExp(listType, 'i') }).first(),
   ];
 
   let clicked = false;
-  for (const sel of selectors) {
-    const link = page.locator(sel).first();
-    if (await link.count()) {
-      await link.scrollIntoViewIfNeeded().catch(() => {});
-      await link.click({ timeout: 10000 }).catch(() => {});
+  for (const loc of candidateLocators) {
+    try {
+      if (!(await loc.count())) continue;
+      await loc.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
+      await loc.click({ timeout: 5000 });
       clicked = true;
+      logger.info('Clicked list link', { listType });
       break;
+    } catch (err) {
+      logger.debug('Locator click failed', { listType, error: err.message });
     }
   }
 
   if (!clicked) {
-    // Fallback: direct URL (works in most logged-in cases).
-    logger.warn('Follower link not found via selector, falling back to direct URL');
-    await page.goto(`${profileUrl}${listType}/`, { waitUntil: 'domcontentloaded' });
+    // Last-ditch: try direct URL.
+    logger.warn('All locators failed; trying direct URL');
+    await page
+      .goto(`${profileUrl}${listType}/`, { waitUntil: 'domcontentloaded' })
+      .catch(() => {});
   }
 
   const dialog = page.locator('div[role="dialog"]').first();
-  await dialog.waitFor({ state: 'visible', timeout: 30000 });
-  return dialog;
+  try {
+    await dialog.waitFor({ state: 'visible', timeout: 8000 });
+    return dialog;
+  } catch {
+    logger.warn(
+      `>>> Could not open the "${listType}" dialog automatically. ` +
+        `Please CLICK the "${listType}" count in the browser window now. ` +
+        `Waiting up to 2 minutes...`
+    );
+    await dialog.waitFor({ state: 'visible', timeout: 120000 });
+    logger.info('Dialog opened (manual click)');
+    return dialog;
+  }
+}
+
+/**
+ * Scroll the followers/following dialog once. Prefers scrolling the LAST
+ * user row into view (which reliably triggers IG's lazy-load) over setting
+ * scrollTop on a guessed container.
+ */
+async function scrollDialogOnce(page, profileUsername) {
+  return page.evaluate((self) => {
+    const dlg = document.querySelector('div[role="dialog"]');
+    if (!dlg) return { ok: false, rows: 0 };
+
+    // Choose the scrollable descendant that contains the MOST profile links.
+    // This avoids picking a "Suggested" sub-scroller or header bar.
+    const scrollables = [...dlg.querySelectorAll('*')].filter((el) => {
+      const s = getComputedStyle(el);
+      return s.overflowY === 'auto' || s.overflowY === 'scroll';
+    });
+    const skip = new Set([
+      'explore','p','reels','stories','direct','accounts','tv',
+      'challenge','legal','about','developer', self,
+    ]);
+    const profileLinks = (root) =>
+      [...root.querySelectorAll('a[role="link"][href^="/"]')].filter((a) => {
+        const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)\/?$/);
+        return m && !skip.has(m[1]);
+      });
+
+    let best = null;
+    let bestCount = -1;
+    for (const s of scrollables) {
+      const c = profileLinks(s).length;
+      if (c > bestCount) {
+        best = s;
+        bestCount = c;
+      }
+    }
+    if (!best) {
+      // Fallback: scroll the dialog itself if no specific scroller found.
+      dlg.scrollTop = dlg.scrollHeight;
+      return { ok: true, rows: profileLinks(dlg).length };
+    }
+
+    const links = profileLinks(best);
+    if (links.length > 0) {
+      links[links.length - 1].scrollIntoView({ block: 'end', behavior: 'instant' });
+    } else {
+      best.scrollTop = best.scrollHeight;
+    }
+    return { ok: true, rows: links.length };
+  }, profileUsername);
 }
 
 /**
  * Scrape one list (followers or following) by combining two strategies:
- *   1) Intercept Instagram's internal JSON responses (stable structure, fast).
+ *   1) Intercept Instagram's internal JSON responses (stable structure).
  *   2) Scrape anchor hrefs inside the dialog as a DOM fallback.
+ * The loop keeps going while the list is still growing or until it's within
+ * a small margin of the expected count from the profile header.
  */
 async function scrapeList({
   page,
@@ -161,6 +283,7 @@ async function scrapeList({
   idleScrollLimit,
   maxScrollIterations,
   scrollDelayMs,
+  expectedCount,
 }) {
   if (listType !== 'followers' && listType !== 'following') {
     throw new Error(`Invalid listType: ${listType}`);
@@ -194,73 +317,69 @@ async function scrapeList({
   page.on('response', onResponse);
 
   try {
-    const dialog = await openListDialog(page, profileUsername, listType);
+    await openListDialog(page, profileUsername, listType);
 
-    // Give the dialog a moment to mount & fire its first request.
-    await sleep(1500);
+    // Let the dialog mount and fire its first request.
+    await sleep(2000);
 
     let idleCycles = 0;
     let lastSize = 0;
+    // If we know the target count, keep pushing past the idle limit until
+    // we're close (within 2%). This handles IG pausing pagination mid-list.
+    const target = expectedCount && expectedCount > 0 ? expectedCount : null;
+    const closeEnough = target ? Math.max(target - Math.ceil(target * 0.02), target - 5) : null;
 
     for (let i = 0; i < maxScrollIterations; i++) {
-      // Scroll the scrollable descendant of the dialog. Finding it dynamically
-      // avoids relying on brittle class selectors.
-      await page.evaluate(() => {
-        const dlg = document.querySelector('div[role="dialog"]');
-        if (!dlg) return;
-        let scrollable = null;
-        let maxHeight = 0;
-        for (const el of dlg.querySelectorAll('*')) {
-          const style = getComputedStyle(el);
-          const canScroll =
-            (style.overflowY === 'auto' || style.overflowY === 'scroll') &&
-            el.scrollHeight > el.clientHeight + 4;
-          if (canScroll && el.scrollHeight > maxHeight) {
-            scrollable = el;
-            maxHeight = el.scrollHeight;
-          }
-        }
-        if (scrollable) {
-          scrollable.scrollTop = scrollable.scrollHeight;
-        }
-      });
-
-      // Nudge with wheel events too; some builds of IG only paginate on wheel.
-      try {
-        const box = await dialog.boundingBox();
-        if (box) {
-          await page.mouse.move(box.x + box.width / 2, box.y + box.height - 20);
-          await page.mouse.wheel(0, 2000);
-        }
-      } catch {
-        /* ignore */
-      }
-
+      await scrollDialogOnce(page, profileUsername);
       await sleep(scrollDelayMs + Math.floor(Math.random() * 600));
 
       if (collected.size === lastSize) {
         idleCycles += 1;
+        const reachedTarget = target ? collected.size >= closeEnough : false;
+
         if (idleCycles >= idleScrollLimit) {
-          logger.info('Reached end of list', { listType, size: collected.size });
+          if (target && !reachedTarget && idleCycles < idleScrollLimit * 3) {
+            // Under-collected vs the profile-header count. Pause longer and
+            // try a harder scroll burst before giving up.
+            logger.info('Under target, pausing and retrying', {
+              listType,
+              collected: collected.size,
+              target,
+            });
+            await sleep(4000);
+            for (let k = 0; k < 5; k++) {
+              await scrollDialogOnce(page, profileUsername);
+              await sleep(scrollDelayMs);
+            }
+            continue;
+          }
+          logger.info('Reached end of list', {
+            listType,
+            size: collected.size,
+            target: target ?? 'unknown',
+          });
           break;
         }
       } else {
         idleCycles = 0;
         lastSize = collected.size;
         if (i % 5 === 0) {
-          logger.info('Scrolling...', { listType, collected: collected.size });
+          logger.info('Scrolling...', {
+            listType,
+            collected: collected.size,
+            target: target ?? 'unknown',
+          });
         }
       }
     }
 
     // DOM fallback: collect usernames from anchor hrefs inside the dialog.
-    // Captures anything the network interceptor may have missed (e.g. server-rendered first batch).
     const domUsernames = await page.$$eval(
       'div[role="dialog"] a[role="link"]',
-      (links) => {
+      (links, ownUsername) => {
         const skip = new Set([
-          'explore', 'p', 'reels', 'stories', 'direct', 'accounts',
-          'tv', 'challenge', 'legal', 'about', 'developer',
+          'explore','p','reels','stories','direct','accounts','tv',
+          'challenge','legal','about','developer', ownUsername,
         ]);
         const out = [];
         for (const a of links) {
@@ -269,17 +388,26 @@ async function scrapeList({
           if (m && !skip.has(m[1])) out.push(m[1]);
         }
         return out;
-      }
+      },
+      profileUsername
     );
     for (const u of domUsernames) collected.add(normalizeUsername(u));
 
     logger.info('List scrape finished', {
       listType,
       size: collected.size,
+      target: expectedCount ?? 'unknown',
       networkResponses: networkHits,
     });
 
-    // Close the dialog before moving on.
+    if (expectedCount && collected.size < Math.floor(expectedCount * 0.95)) {
+      logger.warn(
+        `Collected ${collected.size}/${expectedCount} ${listType}. ` +
+          `Instagram may be throttling or virtualizing the list. ` +
+          `Try rerunning, increasing IDLE_SCROLL_LIMIT, or raising SCROLL_DELAY_MS.`
+      );
+    }
+
     await page.keyboard.press('Escape').catch(() => {});
     await sleep(500);
 
@@ -293,4 +421,5 @@ module.exports = {
   normalizeUsername,
   ensureLoggedIn,
   scrapeList,
+  getProfileCounts,
 };
