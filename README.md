@@ -105,25 +105,39 @@ Key variables (all optional, sensible defaults):
 | `MAX_SCROLL_ITERATIONS` | `4000`               | Safety upper bound on scroll iterations per list.       |
 | `SCROLL_DELAY_MS`       | `1400`               | Base delay between scrolls (small random jitter added). |
 
-### Authenticate (once)
+### Authenticate (once) — no credentials in config
 
-You have two options:
-
-**A — Manual login (recommended, handles 2FA / checkpoints cleanly):**
+**You never need to put your Instagram password in `.env`, the repo, or
+anywhere else on disk.** The recommended flow uses an interactive login,
+exactly like logging into Instagram in Chrome:
 
 ```bash
 npm run login
 ```
 
-A Chromium window opens. Log into Instagram manually. When the nav rail
-appears the script detects it, saves the session in `.browser-data/`, and
-exits. All later runs reuse that session.
+1. A Chromium window opens at instagram.com.
+2. Log in manually — username, password, 2FA, any checkpoints. The script
+   doesn't see what you type.
+3. Once the nav rail appears, the script detects you're logged in, saves the
+   resulting **session cookie** to `./.browser-data/`, and exits.
+4. Every later `npm start` reuses that cookie. Your password is not stored
+   and not seen by the script.
 
-**B — Credentials in `.env`:**
+This is the same security model as staying logged in to Instagram in a
+regular browser: a session cookie in a local profile folder. The
+`.browser-data/` directory is gitignored so it cannot be accidentally
+committed — still, treat it like you'd treat your browser profile, and don't
+share it.
 
-Fill `IG_USERNAME` and `IG_PASSWORD`. The script will attempt to log in on
-start. If Instagram shows a checkpoint / 2FA, complete it in the visible
-browser window — the script falls back to waiting for a manual login.
+<details>
+<summary>Alternative (not recommended): credentials in <code>.env</code></summary>
+
+For unattended / headless setups only, you can set `IG_USERNAME` and
+`IG_PASSWORD` in `.env` and the script will attempt an automated login. For
+personal use on your own account, use `npm run login` instead — storing your
+Instagram password in a file is unnecessary risk.
+
+</details>
 
 ### Run
 
